@@ -1,0 +1,28 @@
+# ===== Keil MDK 编译产物（不入库）=====
+MDK-ARM/STM32H743/
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.bin
+*.elf
+*.map
+*.lnp
+*.lst
+*.dep
+*.htm
+*.sct
+*.iex
+*.tra
+*.__i
+*.bak
+
+# Keil 个人界面状态（每台机器不同）
+*.uvguix.*
+*.uvoptx.bak
+
+# ===== 操作系统 =====
+Thumbs.db
+desktop.ini
+.DS_Store
