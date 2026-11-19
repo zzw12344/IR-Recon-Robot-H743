@@ -1,27 +1,34 @@
 /***
 	*************************************************************************************************
 	*	@file  	main.c
-	*	@brief  8 路灰度传感器测试（YAHBOOM YB-MYX06-V1.0）
+	*	@brief  模式一：8 路灰度循线（串级控制：位置环 PD + 速度环 PI）
 	*
-	*   接线：
-	*     传感器 5V  -> D24A 的 5V 输出
-	*     传感器 GND -> GND
-	*     传感器 AD0 -> PC0   （地址最低位）
-	*     传感器 AD1 -> PC1   （地址中位）
-	*     传感器 AD2 -> PC2   （地址最高位）
-	*     传感器 OUT -> PA3   （ADC1_INP15，模拟输入，直连不用电阻）
+	*   传感器：YAHBOOM YB-MYX06-V1.0（74HC4051 八选一，单 OUT 模拟输出）
+	*     5V->5V  GND->GND  AD0->PC0  AD1->PC1  AD2->PC2  OUT->PA3(ADC1_INP15)
+	*   电机接线见 motor.h（TIM1 PWM + 编码器 TIM2/3/4/8）
+	*   轮子位置：A=右后  B=右前  C=左前  D=左后
+	*   串口：USART1 PA9/PA10，115200 8N1，调试打印用
 	*
-	*   串口：USART1 PA9/PA10，115200 8N1，接 CH340
+	*   上电流程：
+	*     1. 初始化 + 灰度标定 1.5 秒（此时传感器放在白纸/浅色桌面上）
+	*     2. ST_IDLE：四轮不动，等黑线（连续 3 次有效才算，防反光误触发）
+	*     3. ST_WAIT：检测到黑线后再停 5 秒，四轮仍不动（E 持续更新）
+	*     4. ST_RUN ：开始循线
+	*     5. 丢线超 1 秒 -> ST_STOP 永久停车（需复位重启）
 	*
-	*   上电后 1.5 秒自动标定白值（此时把传感器放在白纸或浅色桌面上）
-	*   之后每 100ms 打印一行：8 路原始值、黑线中心位置、强反射（手指）中心位置
+	*   控制结构：
+	*     每 10ms：扫 8 路 -> 算重心 E -> 一阶低通滤波
+	*     每 20ms：位置环 PD -> 左右目标速度(mm/s) -> 速度环 PI -> PWM
+	*     每 200ms：串口打印一行调试信息（正式比赛可注释掉）
 	************************************************************************************************
 ***/
 
 #include "main.h"
 #include "led.h"
+#include "motor.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 
 /********************************************** 函数声明 *******************************************/
@@ -37,31 +44,63 @@ static uint16_t ADC_Read(void);
 static void     Gray_Scan(void);
 static void     Gray_Calibrate(void);
 static void     Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *valid);
-static void     Gray_CalcBright(float *center, float *weight, uint8_t *hit, uint8_t *valid);
 static void     FmtF(float v, int dec, char *out);
 
+static void     Motors_Stop(void);
+static float    SpeedPI(uint8_t idx, float target, float actual);
+static void     SpeedLoop(void);
+static void     Control_20ms(void);
+static void     Print_Debug(void);
 
-/********************************************** 可调参数 *******************************************/
+
+/********************************************** 灰度参数 *******************************************/
 #define GRAY_CH_NUM            8U
-#define GRAY_ADC_FULL          4095.0f     /* 12 位 ADC 满量程 */
 #define GRAY_SETTLE_US         100U        /* 通道切换后的稳定延时 */
 #define GRAY_SCAN_PERIOD_MS    10U         /* 扫描周期 */
-#define GRAY_PRINT_PERIOD_MS   100U        /* 打印周期 */
-#define GRAY_STAT_PERIOD_MS    2000U       /* min/max 统计打印周期 */
 #define GRAY_CALIB_MS          1500U       /* 上电标定时长 */
-#define GRAY_PITCH_MM          12.0f       /* 相邻探头中心距，用于把中心换算成毫米 */
+#define GRAY_PITCH_MM          12.0f       /* 相邻探头中心距 */
 
-/* 判黑：原始值比白值低多少比例才算“黑线”。越小越灵敏，噪声也越容易被当成黑 */
+/* 判黑：比白值暗多少比例才算黑线。越小越灵敏，也越容易误判 */
 #define GRAY_DARK_RATIO        0.35f
-
-/* 判白：原始值比白值高多少比例才算“强反射物”（用手指遮挡测试用） */
-#define GRAY_BRIGHT_RATIO      0.25f
-
-/* 总权重低于此值视为丢线，不输出中心 */
+/* 总权重低于此值视为丢线 */
 #define GRAY_MIN_WEIGHT        0.30f
-
-/* 传感器装反了（X1 实际在最右边）就把这里改成 1 */
+/* 传感器装反了（X1 实际在最右边）改成 1 */
 #define GRAY_REVERSE           0
+
+
+/********************************************** 节拍参数 *******************************************/
+#define CTRL_PERIOD_MS         20U         /* 位置环 + 速度环周期 */
+#define PRINT_PERIOD_MS        200U        /* 调试打印周期（阻塞约 6ms） */
+
+
+/********************************************** 位置环参数（外环 PD） *****************************/
+#define V_BASE                 200.0f      /* 基础前进速度 mm/s */
+#define V_MIN_RATIO            0.4f        /* 偏差最大时速度降到基础的 40% */
+#define KP_POS                 60.0f       /* 比例：每 1 个探头偏差 -> 60mm/s 差速 */
+#define KD_POS                 6.0f        /* 微分：抑制来回摇摆，从 KP 的 0.1 倍起步 */
+#define DV_LIMIT               200.0f      /* 差速限幅 mm/s */
+#define V_TARGET_MAX           350.0f      /* 单轮目标速度上限 mm/s */
+#define E_FILTER_NEW           0.3f        /* 一阶低通：新值占 30% */
+#define E_FILTER_OLD           0.7f        /*             历史占 70% */
+
+
+/********************************************** 速度环参数（内环 PI） *****************************/
+/* 空载实测值，带载后若稳态误差偏大，优先加大 KI_SPD */
+#define KP_SPD                 0.8f
+#define KI_SPD                 13.0f
+#define SPD_DT                 0.02f       /* = CTRL_PERIOD_MS / 1000 */
+#define INTEGRAL_MAX           46.0f       /* 积分限幅：KI*46 = 600 = PWM_LIMIT */
+
+
+/********************************************** 丢线参数 *******************************************/
+#define LOST_SPEED             80.0f       /* 丢线后低速找线 mm/s */
+#define LOST_TURN              80.0f       /* 叠加的转向差速：内侧轮停、外侧轮 160 */
+#define LOST_TIMEOUT_MS        1000U       /* 丢线超过 1 秒停车 */
+
+
+/********************************************** 启动参数 *******************************************/
+#define START_WAIT_MS          5000U       /* 检测到黑线后再停 5 秒 */
+#define DETECT_CONFIRM         3U          /* 连续 3 次有效才确认有黑线（30ms 防抖） */
 
 
 /********************************************** 地址线宏 *******************************************/
@@ -73,35 +112,61 @@ static void     FmtF(float v, int dec, char *out);
 #define AD2_L()   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET)
 
 
+/********************************************** 运行状态 *******************************************/
+typedef enum
+{
+	ST_IDLE = 0,   /* 等黑线，四轮不动 */
+	ST_WAIT,       /* 已检测到，倒计时 5 秒，四轮不动 */
+	ST_RUN,        /* 正常循线 */
+	ST_STOP        /* 丢线超时，永久停车 */
+} RunState;
+
+
 /********************************************** 全局变量 *******************************************/
 static ADC_HandleTypeDef  s_hadc1;
 static UART_HandleTypeDef s_huart1;
 
-static uint16_t s_raw[GRAY_CH_NUM];      /* 本次扫描的原始值 */
-static uint16_t s_white[GRAY_CH_NUM];    /* 上电标定得到的白值 */
-static uint16_t s_min[GRAY_CH_NUM];      /* 运行中见过的最小值（找阈值用） */
-static uint16_t s_max[GRAY_CH_NUM];      /* 运行中见过的最大值（找阈值用） */
+static uint16_t s_raw[GRAY_CH_NUM];      /* 本次扫描原始值 */
+static uint16_t s_white[GRAY_CH_NUM];    /* 上电标定的白值 */
+
+static RunState s_state = ST_IDLE;
+
+static float   s_e_raw = 0.0f;           /* 本次算出的重心（未滤波） */
+static float   s_e     = 0.0f;           /* 滤波后的重心，控制用 */
+static float   s_e_last = 0.0f;          /* 上一次重心，微分项用 */
+static float   s_weight = 0.0f;
+static uint8_t s_hit = 0;
+static uint8_t s_valid = 0;              /* 1=有黑线 0=丢线 */
+
+static float   s_last_sign = 1.0f;       /* 丢线前最后一次偏差符号：+1 线在右，-1 线在左 */
+static uint32_t s_lost_ms = 0;
+
+/* 轮子顺序固定：0=A右后 1=B右前 2=C左前 3=D左后 */
+static float   s_target[4]  = {0};       /* 目标速度 mm/s */
+static float   s_actual[4]  = {0};       /* 实际速度 mm/s */
+static float   s_integral[4] = {0};      /* 速度环积分项 */
+
+static float   s_v_base = 0.0f;
+static float   s_dv     = 0.0f;
+static uint32_t s_wait_start = 0;
+static uint8_t  s_detect_cnt = 0;
 
 
 /***************************************************************************************************
 *	函 数 名: main
-*	函数功能: 上电标定白值，之后循环扫描 8 路灰度并输出中心位置
+*	函数功能: 初始化后进入主循环，按 10/20/200/500ms 四个节拍调度
 ****************************************************************************************************/
 int main(void)
 {
 	uint32_t scan_tick;
+	uint32_t ctrl_tick;
 	uint32_t print_tick;
-	uint32_t stat_tick;
 	uint32_t led_tick;
-	char     buf[180];
-	char     f1[16];
-	char     f2[16];
-	int      i;
 
 	SCB_EnableICache();
 	SCB_EnableDCache();
 	HAL_Init();
-	SystemClock_Config();		/* 480MHz */
+	SystemClock_Config();		/* SYSCLK 480MHz，HCLK(CPU) 240MHz */
 
 	LED_Init();
 	DWT_Init();
@@ -109,127 +174,249 @@ int main(void)
 	Gray_GPIO_Init();
 	ADC1_Init();
 
-	UART_Send("\r\n=== YB-MYX06 8 路灰度测试 ===\r\n");
+	MotorA_Init();
+	MotorB_Init();
+	MotorC_Init();
+	MotorD_Init();
+
+	UART_Send("\r\n=== 模式一：8 路灰度循线 ===\r\n");
 	UART_Send("正在标定白值，请把传感器放在白纸/浅色桌面上，保持 1.5 秒...\r\n");
 
 	Gray_Calibrate();
 
-	/* 打印标定得到的白值和对应阈值，这就是“好的固定阈值”的参考 */
-	UART_Send("标定完成。白值 W 与判黑阈值 TH（低于 TH 判为黑线）：\r\n");
-	snprintf(buf, sizeof(buf), "  W :%4u %4u %4u %4u %4u %4u %4u %4u\r\n",
-	         s_white[0], s_white[1], s_white[2], s_white[3],
-	         s_white[4], s_white[5], s_white[6], s_white[7]);
-	UART_Send(buf);
-	snprintf(buf, sizeof(buf), "  TH:%4u %4u %4u %4u %4u %4u %4u %4u\r\n",
-	         (unsigned)(s_white[0] * (1.0f - GRAY_DARK_RATIO)),
-	         (unsigned)(s_white[1] * (1.0f - GRAY_DARK_RATIO)),
-	         (unsigned)(s_white[2] * (1.0f - GRAY_DARK_RATIO)),
-	         (unsigned)(s_white[3] * (1.0f - GRAY_DARK_RATIO)),
-	         (unsigned)(s_white[4] * (1.0f - GRAY_DARK_RATIO)),
-	         (unsigned)(s_white[5] * (1.0f - GRAY_DARK_RATIO)),
-	         (unsigned)(s_white[6] * (1.0f - GRAY_DARK_RATIO)),
-	         (unsigned)(s_white[7] * (1.0f - GRAY_DARK_RATIO)));
-	UART_Send(buf);
-	UART_Send("\r\n用手指遮住一个或多个探头，看 BRIGHT 行的 E 是否指向挡住的位置\r\n");
-	UART_Send("用黑胶带/黑纸盖住探头，看 DARK 行的 E 是否正确\r\n\r\n");
+	UART_Send("标定完成。四轮保持不动，把黑线放到传感器下方即开始 5 秒倒计时。\r\n");
 
 	scan_tick  = HAL_GetTick();
+	ctrl_tick  = scan_tick;
 	print_tick = scan_tick;
-	stat_tick  = scan_tick;
 	led_tick   = scan_tick;
 
 	while (1)
 	{
-		/* 10ms 扫描一轮 */
+		/* ---------------- 10ms：扫描 + 算重心 + 滤波 ---------------- */
 		if ((HAL_GetTick() - scan_tick) >= GRAY_SCAN_PERIOD_MS)
 		{
 			scan_tick += GRAY_SCAN_PERIOD_MS;
+
 			Gray_Scan();
+			Gray_CalcDark(&s_e_raw, &s_weight, &s_hit, &s_valid);
 
-			/* 统计历史最值，帮助确定固定阈值 */
-			for (i = 0; i < (int)GRAY_CH_NUM; i++)
+			if (s_valid)
 			{
-				if (s_raw[i] < s_min[i]) s_min[i] = s_raw[i];
-				if (s_raw[i] > s_max[i]) s_max[i] = s_raw[i];
+				/* 一阶低通：新值 30% + 历史 70%，压掉单帧毛刺 */
+				s_e = E_FILTER_OLD * s_e + E_FILTER_NEW * s_e_raw;
+
+				/* 记下偏差符号，丢线后要靠它决定往哪边找 */
+				s_last_sign = (s_e >= 0.0f) ? 1.0f : -1.0f;
+				s_lost_ms   = 0;
 			}
 		}
 
-		/* 100ms 打印一次 */
-		if ((HAL_GetTick() - print_tick) >= GRAY_PRINT_PERIOD_MS)
+		/* ---------------- 20ms：状态机 + 位置环 + 速度环 ---------------- */
+		if ((HAL_GetTick() - ctrl_tick) >= CTRL_PERIOD_MS)
 		{
-			float   e_dark;
-			float   w_dark;
-			float   e_bright;
-			float   w_bright;
-			uint8_t hit_dark;
-			uint8_t hit_bright;
-			uint8_t ok_dark;
-			uint8_t ok_bright;
-
-			print_tick += GRAY_PRINT_PERIOD_MS;
-
-			Gray_CalcDark(&e_dark, &w_dark, &hit_dark, &ok_dark);
-			Gray_CalcBright(&e_bright, &w_bright, &hit_bright, &ok_bright);
-
-			snprintf(buf, sizeof(buf), "R: %4u %4u %4u %4u %4u %4u %4u %4u\r\n",
-			         s_raw[0], s_raw[1], s_raw[2], s_raw[3],
-			         s_raw[4], s_raw[5], s_raw[6], s_raw[7]);
-			UART_Send(buf);
-
-			/* 黑线中心：E 为探头序号单位（-3.5~+3.5），括号内为毫米 */
-			FmtF(e_dark, 2, f1);
-			FmtF(e_dark * GRAY_PITCH_MM, 1, f2);
-			if (ok_dark)
-			{
-				snprintf(buf, sizeof(buf), "  DARK  E:%s (%s mm)  W:%u.%02u  HIT:0x%02X\r\n",
-				         f1, f2,
-				         (unsigned)w_dark, (unsigned)((w_dark - (unsigned)w_dark) * 100.0f + 0.5f),
-				         hit_dark);
-			}
-			else
-			{
-				snprintf(buf, sizeof(buf), "  DARK  ---- 丢线（黑线未覆盖到探头）----\r\n");
-			}
-			UART_Send(buf);
-
-			/* 强反射中心：手指遮挡时看这一行 */
-			FmtF(e_bright, 2, f1);
-			FmtF(e_bright * GRAY_PITCH_MM, 1, f2);
-			if (ok_bright)
-			{
-				snprintf(buf, sizeof(buf), "  BRIGHT E:%s (%s mm)  W:%u.%02u  HIT:0x%02X\r\n",
-				         f1, f2,
-				         (unsigned)w_bright, (unsigned)((w_bright - (unsigned)w_bright) * 100.0f + 0.5f),
-				         hit_bright);
-			}
-			else
-			{
-				snprintf(buf, sizeof(buf), "  BRIGHT ---- 无强反射（手指没挡住或挡得不够近）----\r\n");
-			}
-			UART_Send(buf);
+			ctrl_tick += CTRL_PERIOD_MS;
+			Control_20ms();
 		}
 
-		/* 2 秒打印一次历史最值 */
-		if ((HAL_GetTick() - stat_tick) >= GRAY_STAT_PERIOD_MS)
+		/* ---------------- 200ms：调试打印 ---------------- */
+		if ((HAL_GetTick() - print_tick) >= PRINT_PERIOD_MS)
 		{
-			stat_tick += GRAY_STAT_PERIOD_MS;
-			snprintf(buf, sizeof(buf), "  MIN:%4u %4u %4u %4u %4u %4u %4u %4u\r\n",
-			         s_min[0], s_min[1], s_min[2], s_min[3],
-			         s_min[4], s_min[5], s_min[6], s_min[7]);
-			UART_Send(buf);
-			snprintf(buf, sizeof(buf), "  MAX:%4u %4u %4u %4u %4u %4u %4u %4u\r\n\r\n",
-			         s_max[0], s_max[1], s_max[2], s_max[3],
-			         s_max[4], s_max[5], s_max[6], s_max[7]);
-			UART_Send(buf);
+			print_tick += PRINT_PERIOD_MS;
+			Print_Debug();
 		}
 
-		/* 500ms 心跳 */
-		if ((HAL_GetTick() - led_tick) >= 500U)
+		/* ---------------- LED：正常 500ms 心跳，停车 100ms 快闪 ---------------- */
+		if ((HAL_GetTick() - led_tick) >= ((s_state == ST_STOP) ? 100U : 500U))
 		{
-			led_tick += 500U;
+			led_tick = HAL_GetTick();
 			LED1_Toggle;
 		}
 	}
+}
+
+/***************************************************************************************************
+*	函 数 名: Control_20ms
+*	函数功能: 运行状态机。RUN 态下先位置环算出左右目标速度，再速度环输出 PWM
+****************************************************************************************************/
+static void Control_20ms(void)
+{
+	float vL;
+	float vR;
+
+	switch (s_state)
+	{
+	case ST_IDLE:
+		Motors_Stop();
+		if (s_valid)
+		{
+			s_detect_cnt++;
+			if (s_detect_cnt >= DETECT_CONFIRM)
+			{
+				s_detect_cnt  = 0;
+				s_wait_start  = HAL_GetTick();
+				s_state       = ST_WAIT;
+				UART_Send("检测到黑线，5 秒后启动...\r\n");
+			}
+		}
+		else
+		{
+			s_detect_cnt = 0;
+		}
+		break;
+
+	case ST_WAIT:
+		Motors_Stop();       /* 等待期间四轮始终不动，但扫描仍在继续 */
+		if ((HAL_GetTick() - s_wait_start) >= START_WAIT_MS)
+		{
+			s_e_last  = s_e;     /* 防止启动瞬间微分项爆出一个大值 */
+			s_lost_ms = 0;
+			s_state   = ST_RUN;
+			UART_Send("启动！\r\n");
+		}
+		break;
+
+	case ST_RUN:
+		if (s_valid)
+		{
+			/* ===== 位置环（外环 PD）：输出左右目标速度，不直接碰 PWM ===== */
+
+			/* ① 偏差越大基础速度越低，过弯不丢线 */
+			s_v_base = V_BASE * (1.0f - (1.0f - V_MIN_RATIO) * fabsf(s_e) / 3.5f);
+
+			/* ② PD 算差速：E>0 线在右 -> 左轮快右轮慢 -> 向右转 */
+			s_dv = KP_POS * s_e + KD_POS * (s_e - s_e_last);
+			if (s_dv >  DV_LIMIT) s_dv =  DV_LIMIT;
+			if (s_dv < -DV_LIMIT) s_dv = -DV_LIMIT;
+
+			vL = s_v_base + s_dv;
+			vR = s_v_base - s_dv;
+		}
+		else
+		{
+			/* ===== 丢线：按最后一次偏差符号，低速往那边转着找 ===== */
+			s_lost_ms += CTRL_PERIOD_MS;
+			if (s_lost_ms >= LOST_TIMEOUT_MS)
+			{
+				s_state = ST_STOP;
+				Motors_Stop();
+				UART_Send("丢线超过 1 秒，停车。\r\n");
+				break;
+			}
+			vL = LOST_SPEED + s_last_sign * LOST_TURN;
+			vR = LOST_SPEED - s_last_sign * LOST_TURN;
+		}
+
+		/* 目标速度限幅：不允许反转，防止过度甩尾 */
+		if (vL > V_TARGET_MAX) vL = V_TARGET_MAX;
+		if (vR > V_TARGET_MAX) vR = V_TARGET_MAX;
+		if (vL < 0.0f) vL = 0.0f;
+		if (vR < 0.0f) vR = 0.0f;
+
+		s_target[2] = vL;      /* C 左前 */
+		s_target[3] = vL;      /* D 左后 */
+		s_target[0] = vR;      /* A 右后 */
+		s_target[1] = vR;      /* B 右前 */
+
+		s_e_last = s_e;
+		SpeedLoop();           /* ===== 速度环（内环 PI）===== */
+		break;
+
+	case ST_STOP:
+	default:
+		Motors_Stop();
+		break;
+	}
+}
+
+/***************************************************************************************************
+*	函 数 名: SpeedLoop
+*	函数功能: 四个轮子各跑一次 PI，输出 PWM
+****************************************************************************************************/
+static void SpeedLoop(void)
+{
+	s_actual[0] = MotorA_UpdateSpeed();
+	s_actual[1] = MotorB_UpdateSpeed();
+	s_actual[2] = MotorC_UpdateSpeed();
+	s_actual[3] = MotorD_UpdateSpeed();
+
+	MotorA_SetPWM((int16_t)SpeedPI(0, s_target[0], s_actual[0]));
+	MotorB_SetPWM((int16_t)SpeedPI(1, s_target[1], s_actual[1]));
+	MotorC_SetPWM((int16_t)SpeedPI(2, s_target[2], s_actual[2]));
+	MotorD_SetPWM((int16_t)SpeedPI(3, s_target[3], s_actual[3]));
+}
+
+/***************************************************************************************************
+*	函 数 名: SpeedPI
+*	函数功能: 单轮速度 PI。P 管当前误差，I 管长期静差（克服摩擦和负载）
+*	备    注: 积分必须限幅，否则车被卡住时积分无限涨，脱困瞬间会猛冲
+****************************************************************************************************/
+static float SpeedPI(uint8_t idx, float target, float actual)
+{
+	float err = target - actual;
+	float out;
+
+	s_integral[idx] += err * SPD_DT;
+	if (s_integral[idx] >  INTEGRAL_MAX) s_integral[idx] =  INTEGRAL_MAX;
+	if (s_integral[idx] < -INTEGRAL_MAX) s_integral[idx] = -INTEGRAL_MAX;
+
+	out = KP_SPD * err + KI_SPD * s_integral[idx];
+
+	if (out >  (float)PWM_LIMIT) out =  (float)PWM_LIMIT;
+	if (out < -(float)PWM_LIMIT) out = -(float)PWM_LIMIT;
+
+	return out;
+}
+
+/***************************************************************************************************
+*	函 数 名: Motors_Stop
+*	函数功能: 四轮 PWM 归零、清积分；编码器照常读数，保持计数器同步
+****************************************************************************************************/
+static void Motors_Stop(void)
+{
+	s_target[0] = s_target[1] = s_target[2] = s_target[3] = 0.0f;
+
+	s_actual[0] = MotorA_UpdateSpeed();
+	s_actual[1] = MotorB_UpdateSpeed();
+	s_actual[2] = MotorC_UpdateSpeed();
+	s_actual[3] = MotorD_UpdateSpeed();
+
+	MotorA_SetPWM(0);
+	MotorB_SetPWM(0);
+	MotorC_SetPWM(0);
+	MotorD_SetPWM(0);
+
+	s_integral[0] = s_integral[1] = s_integral[2] = s_integral[3] = 0.0f;
+}
+
+/***************************************************************************************************
+*	函 数 名: Print_Debug
+*	函数功能: 一行打印状态、偏差、左右目标速度和四轮实际速度
+*	输出示例: RUN E:+0.52 DV:+31.0 T:170/202 A:168/171/199/205
+****************************************************************************************************/
+static void Print_Debug(void)
+{
+	static const char *name[4] = {"IDLE", "WAIT", "RUN ", "STOP"};
+	char buf[110];
+	char fe[12];
+	char fdv[12];
+	uint32_t wait_left = 0;
+
+	if (s_state == ST_WAIT)
+	{
+		uint32_t el = HAL_GetTick() - s_wait_start;
+		wait_left = (el >= START_WAIT_MS) ? 0U : (START_WAIT_MS - el) / 1000U + 1U;
+	}
+
+	FmtF(s_e, 2, fe);
+	FmtF(s_dv, 1, fdv);
+
+	snprintf(buf, sizeof(buf), "%s E:%s DV:%s T:%d/%d A:%d/%d/%d/%d W:%u\r\n",
+	         name[(int)s_state], fe, fdv,
+	         (int)s_target[2], (int)s_target[0],
+	         (int)s_actual[0], (int)s_actual[1], (int)s_actual[2], (int)s_actual[3],
+	         (unsigned)wait_left);
+	UART_Send(buf);
 }
 
 /***************************************************************************************************
@@ -266,7 +453,6 @@ static void ADC1_Init(void)
 	__HAL_RCC_GPIOA_CLK_ENABLE();
 	__HAL_RCC_ADC12_CLK_ENABLE();
 
-	/* ADC 内核时钟：CLKP（默认 HSI 64MHz）/ 2 = 32MHz，VOS0 下安全 */
 	pclk.PeriphClockSelection = RCC_PERIPHCLK_ADC;
 	pclk.AdcClockSelection    = RCC_ADCCLKSOURCE_CLKP;
 	if (HAL_RCCEx_PeriphCLKConfig(&pclk) != HAL_OK)
@@ -274,7 +460,7 @@ static void ADC1_Init(void)
 		Error_Handler();
 	}
 
-	/* PA3 模拟模式：不能配上拉/下拉，否则内部分压会导致读数偏低 */
+	/* PA3 模拟模式：不能配上拉/下拉，否则内部分压导致读数偏低 */
 	gpio.Pin  = GPIO_PIN_3;
 	gpio.Mode = GPIO_MODE_ANALOG;
 	gpio.Pull = GPIO_NOPULL;
@@ -302,7 +488,6 @@ static void ADC1_Init(void)
 		Error_Handler();
 	}
 
-	/* 每次上电必须校准一次，否则前几十次读数会飘 */
 	if (HAL_ADCEx_Calibration_Start(&s_hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED) != HAL_OK)
 	{
 		Error_Handler();
@@ -340,93 +525,81 @@ static uint16_t ADC_Read(void)
 
 /***************************************************************************************************
 *	函 数 名: Gray_Scan
-*	函数功能: 依次选中 0~7 号探头，各读一次 OUT
+*	函数功能: 地址线二进制 0~7 依次选通 X1~X8，各读一次 OUT
 ****************************************************************************************************/
 static void Gray_Scan(void)
 {
-	uint8_t i;
+	int i;
 
-	for (i = 0; i < (uint8_t)GRAY_CH_NUM; i++)
+	for (i = 0; i < (int)GRAY_CH_NUM; i++)
 	{
 		if (i & 0x01U) { AD0_H(); } else { AD0_L(); }
 		if (i & 0x02U) { AD1_H(); } else { AD1_L(); }
 		if (i & 0x04U) { AD2_H(); } else { AD2_L(); }
 
-		DelayUs(GRAY_SETTLE_US);      /* 等八选一开关切换稳定 */
-
+		DelayUs(GRAY_SETTLE_US);   /* 等八选一开关切换稳定 */
 		s_raw[i] = ADC_Read();
 	}
 }
 
 /***************************************************************************************************
 *	函 数 名: Gray_Calibrate
-*	函数功能: 1.5 秒内反复扫描，取每路平均值作为白值
+*	函数功能: 上电后在白纸上采约 300 轮，求平均作为每路白值
 ****************************************************************************************************/
 static void Gray_Calibrate(void)
 {
-	uint32_t t0;
 	uint32_t sum[GRAY_CH_NUM] = {0};
 	uint32_t cnt = 0;
-	uint8_t  i;
-
-	t0 = HAL_GetTick();
+	uint32_t t0  = HAL_GetTick();
+	int      i;
 
 	while ((HAL_GetTick() - t0) < GRAY_CALIB_MS)
 	{
 		Gray_Scan();
-
-		for (i = 0; i < (uint8_t)GRAY_CH_NUM; i++)
+		for (i = 0; i < (int)GRAY_CH_NUM; i++)
 		{
 			sum[i] += s_raw[i];
 		}
 		cnt++;
-
 		LED1_Toggle;
 		HAL_Delay(5);
 	}
 
-	if (cnt == 0U)
-	{
-		cnt = 1U;
-	}
+	if (cnt == 0U) cnt = 1U;
 
-	for (i = 0; i < (uint8_t)GRAY_CH_NUM; i++)
+	for (i = 0; i < (int)GRAY_CH_NUM; i++)
 	{
 		s_white[i] = (uint16_t)(sum[i] / cnt);
-		s_min[i]   = s_white[i];
-		s_max[i]   = s_white[i];
 	}
 }
 
 /***************************************************************************************************
 *	函 数 名: Gray_CalcDark
-*	函数功能: 按“比白值暗”的权重算中心位置（黑线）
-*	形    参: center 中心（探头序号单位），weight 总权重，hit 命中位图，valid 是否有效
+*	函数功能: 加权平均求黑线重心。E<0 线在左，E>0 线在右，0 为正中
+*	备    注: 只有 w > GRAY_DARK_RATIO 的通道参与，权重和太小判丢线
 ****************************************************************************************************/
 static void Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *valid)
 {
 	static const float pos[GRAY_CH_NUM] = {-3.5f, -2.5f, -1.5f, -0.5f,
-	                                       0.5f,  1.5f,  2.5f,  3.5f};
-	float   sw = 0.0f;
-	float   se = 0.0f;
-	uint8_t i;
+	                                        0.5f,  1.5f,  2.5f,  3.5f};
+	float sw = 0.0f;
+	float se = 0.0f;
+	int    i;
 
 	*hit = 0;
 
-	for (i = 0; i < (uint8_t)GRAY_CH_NUM; i++)
+	for (i = 0; i < (int)GRAY_CH_NUM; i++)
 	{
 		float w = 0.0f;
 
 		if (s_white[i] > 200U)
 		{
-			/* 相对变暗比例：0 = 和白值一样亮，1 = 全黑 */
 			w = ((float)s_white[i] - (float)s_raw[i]) / (float)s_white[i];
 		}
 
 		if (w > GRAY_DARK_RATIO)
 		{
-			uint8_t idx = GRAY_REVERSE ? (uint8_t)(7U - i) : i;
-
+			uint8_t idx = GRAY_REVERSE ? (uint8_t)(GRAY_CH_NUM - 1U - i) : (uint8_t)i;
 			*hit |= (uint8_t)(1U << idx);
 			sw   += w;
 			se   += w * pos[idx];
@@ -438,56 +611,7 @@ static void Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *v
 	if (sw < GRAY_MIN_WEIGHT)
 	{
 		*center = 0.0f;
-		*valid  = 0U;
-	}
-	else
-	{
-		*center = se / sw;
-		*valid  = 1U;
-	}
-}
-
-/***************************************************************************************************
-*	函 数 名: Gray_CalcBright
-*	函数功能: 按“比白值更亮”的权重算中心位置（手指/白物遮挡）
-****************************************************************************************************/
-static void Gray_CalcBright(float *center, float *weight, uint8_t *hit, uint8_t *valid)
-{
-	static const float pos[GRAY_CH_NUM] = {-3.5f, -2.5f, -1.5f, -0.5f,
-	                                       0.5f,  1.5f,  2.5f,  3.5f};
-	float   sw = 0.0f;
-	float   se = 0.0f;
-	uint8_t i;
-
-	*hit = 0;
-
-	for (i = 0; i < (uint8_t)GRAY_CH_NUM; i++)
-	{
-		float w = 0.0f;
-		float room = GRAY_ADC_FULL - (float)s_white[i];
-
-		if (room > 100.0f)
-		{
-			/* 相对变亮比例：0 = 和白值一样，1 = 冲到满量程 */
-			w = ((float)s_raw[i] - (float)s_white[i]) / room;
-		}
-
-		if (w > GRAY_BRIGHT_RATIO)
-		{
-			uint8_t idx = GRAY_REVERSE ? (uint8_t)(7U - i) : i;
-
-			*hit |= (uint8_t)(1U << idx);
-			sw   += w;
-			se   += w * pos[idx];
-		}
-	}
-
-	*weight = sw;
-
-	if (sw < GRAY_MIN_WEIGHT)
-	{
-		*center = 0.0f;
-		*valid  = 0U;
+		*valid  = 0U;      /* 丢线 */
 	}
 	else
 	{
@@ -498,8 +622,7 @@ static void Gray_CalcBright(float *center, float *weight, uint8_t *hit, uint8_t 
 
 /***************************************************************************************************
 *	函 数 名: FmtF
-*	函数功能: 把浮点数格式化成字符串，避开 Keil MicroLIB 对 %f 的支持问题
-*	形    参: v 待格式化数值，dec 小数位数（1 或 2），out 输出缓冲（至少 16 字节）
+*	函数功能: 浮点转字符串（MicroLIB 的 printf 不支持 %f，只能先转整数再拼）
 ****************************************************************************************************/
 static void FmtF(float v, int dec, char *out)
 {
@@ -514,13 +637,13 @@ static void FmtF(float v, int dec, char *out)
 	}
 	else
 	{
-		sprintf(out, "%d.%0*d", x / mul, dec, x % mul);
+		sprintf(out, "+%d.%0*d", x / mul, dec, x % mul);
 	}
 }
 
 /***************************************************************************************************
 *	函 数 名: DWT_Init
-*	函数功能: 使能内核周期计数器，用于微秒级延时
+*	函数功能: 打开内核周期计数器（240MHz 下 1us = 240 个计数）
 ****************************************************************************************************/
 static void DWT_Init(void)
 {
@@ -531,34 +654,31 @@ static void DWT_Init(void)
 
 /***************************************************************************************************
 *	函 数 名: DelayUs
-*	函数功能: 忙等延时（基于 DWT，480MHz 下误差很小）
+*	函数功能: 微秒级忙等延时（无符号差值，计数器回绕也安全）
 ****************************************************************************************************/
 static void DelayUs(uint32_t us)
 {
 	uint32_t start  = DWT->CYCCNT;
 	uint32_t cycles = us * (SystemCoreClock / 1000000U);
 
-	while ((DWT->CYCCNT - start) < cycles)
-	{
-		/* busy wait */
-	}
+	while ((DWT->CYCCNT - start) < cycles) { }
 }
 
 /***************************************************************************************************
 *	函 数 名: UART1_Init
-*	函数功能: USART1 PA9/PA10，115200 8N1
+*	函数功能: USART1 PA9(TX)/PA10(RX)，115200 8N1
 ****************************************************************************************************/
 static void UART1_Init(void)
 {
 	GPIO_InitTypeDef gpio = {0};
 
-	__HAL_RCC_USART1_CLK_ENABLE();
 	__HAL_RCC_GPIOA_CLK_ENABLE();
+	__HAL_RCC_USART1_CLK_ENABLE();
 
 	gpio.Pin       = GPIO_PIN_9 | GPIO_PIN_10;
 	gpio.Mode      = GPIO_MODE_AF_PP;
 	gpio.Pull      = GPIO_PULLUP;
-	gpio.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+	gpio.Speed     = GPIO_SPEED_FREQ_HIGH;
 	gpio.Alternate = GPIO_AF7_USART1;
 	HAL_GPIO_Init(GPIOA, &gpio);
 
@@ -570,6 +690,7 @@ static void UART1_Init(void)
 	s_huart1.Init.Mode         = UART_MODE_TX_RX;
 	s_huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
 	s_huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+
 	if (HAL_UART_Init(&s_huart1) != HAL_OK)
 	{
 		Error_Handler();
@@ -578,52 +699,27 @@ static void UART1_Init(void)
 
 /***************************************************************************************************
 *	函 数 名: UART_Send
-*	函数功能: 阻塞发送一个字符串
+*	函数功能: 阻塞发送字符串。约 87us/字节，调试期 200ms 一次可接受
 ****************************************************************************************************/
 static void UART_Send(const char *s)
 {
 	HAL_UART_Transmit(&s_huart1, (uint8_t *)s, (uint16_t)strlen(s), 100);
 }
 
-/****************************************************************************************************/
-/**
-  * @brief  System Clock Configuration
-  *         The system Clock is configured as follow :
-  *            System Clock source            = PLL (HSE)
-  *            SYSCLK(Hz)                     = 480000000 (CPU Clock)
-  *            HCLK(Hz)                       = 240000000 (AXI and AHBs Clock)
-  *            AHB Prescaler                  = 2
-  *            D1 APB3 Prescaler              = 2 (APB3 Clock  120MHz)
-  *            D2 APB1 Prescaler              = 2 (APB1 Clock  120MHz)
-  *            D2 APB2 Prescaler              = 2 (APB2 Clock  120MHz)
-  *            D3 APB4 Prescaler              = 2 (APB4 Clock  120MHz)
-  *            HSE Frequency(Hz)              = 25000000
-  *            PLL_M                          = 5
-  *            PLL_N                          = 192
-  *            PLL_P                          = 2
-  *            PLL_Q                          = 4
-  *            PLL_R                          = 2
-  *            VDD(V)                         = 3.3
-  *            Flash Latency(WS)              = 4
-  * @param  None
-  * @retval None
-  */
+/***************************************************************************************************
+*	函 数 名: SystemClock_Config
+*	函数功能: HSE 25M -> PLL 480M -> AHB/2 = HCLK 240M（CPU）-> APB/2 = 120M
+****************************************************************************************************/
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Supply configuration update enable
-  */
   HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
-  /** Configure the main internal regulator output voltage
-  */
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
 
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
+
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -640,8 +736,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
+
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
                               |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
@@ -659,10 +754,6 @@ void SystemClock_Config(void)
   }
 }
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
   __disable_irq();
@@ -670,5 +761,3 @@ void Error_Handler(void)
   {
   }
 }
-
-/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
