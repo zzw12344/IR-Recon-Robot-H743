@@ -14,7 +14,7 @@
 	*     2. ST_IDLE：四轮不动，等黑线（连续 3 次有效才算，防反光误触发）
 	*     3. ST_WAIT：检测到黑线后再停 5 秒，四轮仍不动（E 持续更新）
 	*     4. ST_RUN ：开始循线
-	*     5. 丢线超 1 秒 -> ST_STOP 永久停车（需复位重启）
+	*     5. 丢线超 1 秒或全黑异常持续 300ms -> ST_STOP 永久停车（需复位重启）
 	*
 	*   控制结构：
 	*     每 10ms：扫 8 路 -> 算重心 E -> 一阶低通滤波
@@ -43,6 +43,7 @@ static void     ADC1_Init(void);
 static uint16_t ADC_Read(void);
 static void     Gray_Scan(void);
 static void     Gray_Calibrate(void);
+static void     Gray_TrackWhite(void);
 static void     Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *valid);
 static void     FmtF(float v, int dec, char *out);
 
@@ -64,6 +65,13 @@ static void     Print_Debug(void);
 #define GRAY_DARK_RATIO        0.35f
 /* 总权重低于此值视为丢线 */
 #define GRAY_MIN_WEIGHT        0.30f
+/* 白值慢跟踪：只学习明显偏白的通道，每次向当前读数靠 1% */
+#define GRAY_TRACK_WHITE_W     0.15f
+#define GRAY_TRACK_RATE        0.01f
+/* 至少 7 路命中且平均权重很大，判为悬空/极端暗区，不当成黑线 */
+#define GRAY_FULL_BLACK_CNT    7U
+#define GRAY_FULL_BLACK_W      0.80f
+#define FULL_BLACK_TIMEOUT_MS  300U
 /* 传感器装反了（X1 实际在最右边）改成 1 */
 #define GRAY_REVERSE           0
 
@@ -118,7 +126,7 @@ typedef enum
 	ST_IDLE = 0,   /* 等黑线，四轮不动 */
 	ST_WAIT,       /* 已检测到，倒计时 5 秒，四轮不动 */
 	ST_RUN,        /* 正常循线 */
-	ST_STOP        /* 丢线超时，永久停车 */
+	ST_STOP        /* 丢线超时或全黑异常，永久停车 */
 } RunState;
 
 
@@ -127,7 +135,7 @@ static ADC_HandleTypeDef  s_hadc1;
 static UART_HandleTypeDef s_huart1;
 
 static uint16_t s_raw[GRAY_CH_NUM];      /* 本次扫描原始值 */
-static uint16_t s_white[GRAY_CH_NUM];    /* 上电标定的白值 */
+static float    s_white[GRAY_CH_NUM];    /* 标定白值，运行中对偏白通道慢跟踪 */
 
 static RunState s_state = ST_IDLE;
 
@@ -136,10 +144,11 @@ static float   s_e     = 0.0f;           /* 滤波后的重心，控制用 */
 static float   s_e_last = 0.0f;          /* 上一次重心，微分项用 */
 static float   s_weight = 0.0f;
 static uint8_t s_hit = 0;
-static uint8_t s_valid = 0;              /* 1=有黑线 0=丢线 */
+static uint8_t s_valid = 0;              /* 0=丢线 1=正常黑线 2=全黑异常 */
 
 static float   s_last_sign = 1.0f;       /* 丢线前最后一次偏差符号：+1 线在右，-1 线在左 */
 static uint32_t s_lost_ms = 0;
+static uint32_t s_dark_ms = 0;           /* 全黑异常持续时间 */
 
 /* 轮子顺序固定：0=A右后 1=B右前 2=C左前 3=D左后 */
 static float   s_target[4]  = {0};       /* 目标速度 mm/s */
@@ -200,8 +209,9 @@ int main(void)
 
 			Gray_Scan();
 			Gray_CalcDark(&s_e_raw, &s_weight, &s_hit, &s_valid);
+			Gray_TrackWhite();
 
-			if (s_valid)
+			if (s_valid == 1U)
 			{
 				/* 一阶低通：新值 30% + 历史 70%，压掉单帧毛刺 */
 				s_e = E_FILTER_OLD * s_e + E_FILTER_NEW * s_e_raw;
@@ -248,7 +258,7 @@ static void Control_20ms(void)
 	{
 	case ST_IDLE:
 		Motors_Stop();
-		if (s_valid)
+		if (s_valid == 1U)
 		{
 			s_detect_cnt++;
 			if (s_detect_cnt >= DETECT_CONFIRM)
@@ -277,7 +287,21 @@ static void Control_20ms(void)
 		break;
 
 	case ST_RUN:
-		if (s_valid)
+		if (s_valid == 2U)
+		{
+			/* 全黑时先立即松油门；持续 300ms 认定异常，永久停车 */
+			Motors_Stop();
+			s_dark_ms += CTRL_PERIOD_MS;
+			if (s_dark_ms >= FULL_BLACK_TIMEOUT_MS)
+			{
+				s_state = ST_STOP;
+				UART_Send("全黑异常持续 300ms，停车。\r\n");
+			}
+			break;
+		}
+		s_dark_ms = 0;
+
+		if (s_valid == 1U)
 		{
 			/* ===== 位置环（外环 PD）：输出左右目标速度，不直接碰 PWM ===== */
 
@@ -392,12 +416,13 @@ static void Motors_Stop(void)
 /***************************************************************************************************
 *	函 数 名: Print_Debug
 *	函数功能: 一行打印状态、偏差、左右目标速度和四轮实际速度
-*	输出示例: RUN E:+0.52 DV:+31.0 T:170/202 A:168/171/199/205
+*	输出示例: RUN E:+0.52 DV:+31.0 T:170/202 A:168/171/199/205 W:0 V:1 H:18
 ****************************************************************************************************/
 static void Print_Debug(void)
 {
 	static const char *name[4] = {"IDLE", "WAIT", "RUN ", "STOP"};
-	char buf[110];
+	static uint8_t diag_cnt = 0;
+	char buf[128];
 	char fe[12];
 	char fdv[12];
 	uint32_t wait_left = 0;
@@ -411,12 +436,31 @@ static void Print_Debug(void)
 	FmtF(s_e, 2, fe);
 	FmtF(s_dv, 1, fdv);
 
-	snprintf(buf, sizeof(buf), "%s E:%s DV:%s T:%d/%d A:%d/%d/%d/%d W:%u\r\n",
+	snprintf(buf, sizeof(buf), "%s E:%s DV:%s T:%d/%d A:%d/%d/%d/%d W:%u V:%u H:%02X\r\n",
 	         name[(int)s_state], fe, fdv,
 	         (int)s_target[2], (int)s_target[0],
 	         (int)s_actual[0], (int)s_actual[1], (int)s_actual[2], (int)s_actual[3],
-	         (unsigned)wait_left);
+	         (unsigned)wait_left, (unsigned)s_valid, (unsigned)s_hit);
 	UART_Send(buf);
+
+	/* 每 1 秒打印一次 8 路原始值和当前白值，用于核对代码判定与板载 LED */
+	diag_cnt++;
+	if (diag_cnt >= 5U)
+	{
+		diag_cnt = 0;
+		snprintf(buf, sizeof(buf), "R:%u/%u/%u/%u/%u/%u/%u/%u\r\n",
+		         (unsigned)s_raw[0], (unsigned)s_raw[1],
+		         (unsigned)s_raw[2], (unsigned)s_raw[3],
+		         (unsigned)s_raw[4], (unsigned)s_raw[5],
+		         (unsigned)s_raw[6], (unsigned)s_raw[7]);
+		UART_Send(buf);
+		snprintf(buf, sizeof(buf), "W:%u/%u/%u/%u/%u/%u/%u/%u\r\n",
+		         (unsigned)s_white[0], (unsigned)s_white[1],
+		         (unsigned)s_white[2], (unsigned)s_white[3],
+		         (unsigned)s_white[4], (unsigned)s_white[5],
+		         (unsigned)s_white[6], (unsigned)s_white[7]);
+		UART_Send(buf);
+	}
 }
 
 /***************************************************************************************************
@@ -569,22 +613,46 @@ static void Gray_Calibrate(void)
 
 	for (i = 0; i < (int)GRAY_CH_NUM; i++)
 	{
-		s_white[i] = (uint16_t)(sum[i] / cnt);
+		s_white[i] = (float)sum[i] / (float)cnt;
+	}
+}
+
+/***************************************************************************************************
+*	函 数 名: Gray_TrackWhite
+*	函数功能: 白值慢跟踪。只学习 w<0.15 的偏白通道，避免把黑线学成白值
+*	备    注: 每 10ms 更新 1%，约 1 秒跟踪 63%，用于补偿光照和慢漂移
+****************************************************************************************************/
+static void Gray_TrackWhite(void)
+{
+	int i;
+
+	for (i = 0; i < (int)GRAY_CH_NUM; i++)
+	{
+		if (s_white[i] > 200.0f)
+		{
+			float w = (s_white[i] - (float)s_raw[i]) / s_white[i];
+
+			if (w < GRAY_TRACK_WHITE_W)
+			{
+				s_white[i] += ((float)s_raw[i] - s_white[i]) * GRAY_TRACK_RATE;
+			}
+		}
 	}
 }
 
 /***************************************************************************************************
 *	函 数 名: Gray_CalcDark
 *	函数功能: 加权平均求黑线重心。E<0 线在左，E>0 线在右，0 为正中
-*	备    注: 只有 w > GRAY_DARK_RATIO 的通道参与，权重和太小判丢线
+*	备    注: valid：0=丢线，1=正常黑线，2=全黑异常（悬空/极端暗区）
 ****************************************************************************************************/
 static void Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *valid)
 {
 	static const float pos[GRAY_CH_NUM] = {-3.5f, -2.5f, -1.5f, -0.5f,
 	                                        0.5f,  1.5f,  2.5f,  3.5f};
-	float sw = 0.0f;
-	float se = 0.0f;
-	int    i;
+	float   sw = 0.0f;
+	float   se = 0.0f;
+	uint8_t cnt = 0;
+	int     i;
 
 	*hit = 0;
 
@@ -592,9 +660,9 @@ static void Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *v
 	{
 		float w = 0.0f;
 
-		if (s_white[i] > 200U)
+		if (s_white[i] > 200.0f)
 		{
-			w = ((float)s_white[i] - (float)s_raw[i]) / (float)s_white[i];
+			w = (s_white[i] - (float)s_raw[i]) / s_white[i];
 		}
 
 		if (w > GRAY_DARK_RATIO)
@@ -603,12 +671,18 @@ static void Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *v
 			*hit |= (uint8_t)(1U << idx);
 			sw   += w;
 			se   += w * pos[idx];
+			cnt++;
 		}
 	}
 
 	*weight = sw;
 
-	if (sw < GRAY_MIN_WEIGHT)
+	if ((cnt >= GRAY_FULL_BLACK_CNT) && ((sw / (float)cnt) > GRAY_FULL_BLACK_W))
+	{
+		*center = 0.0f;
+		*valid  = 2U;      /* 近乎全部通道都很暗：不是可循的黑线 */
+	}
+	else if (sw < GRAY_MIN_WEIGHT)
 	{
 		*center = 0.0f;
 		*valid  = 0U;      /* 丢线 */
