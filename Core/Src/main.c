@@ -17,7 +17,9 @@
 	*     1. 上电标定 1.5 秒（传感器放在白纸上），记录每路白纸电平
 	*     2. 由白纸电平自动判断极性：白=低电平 -> 黑线=高电平（本模块）
 	*     3. 每 10ms 分时扫描 8 路，原始值 >= 2048 即判为该路压到黑线
-	*     4. 命中路数 1~6 路 -> 有效；0 路 -> 丢线；>=7 路 -> 悬空/整片黑
+	*     4. 命中路数 1~7 路 -> 有效；0 路 -> 丢线；8 路全黑 -> 悬空/整片黑
+	*     5. 只取最长连续黑段参与计算；黑段触到 X1 或 X8 时，说明线已伸出视野，
+	*        直接输出 ±3.0 的饱和偏差，保证粗线拐角能硬转过去
 	*
 	*   位置与权重：
 	*     探头位置 pos 从左到右：-3.5 -2.5 -1.5 -0.5 0.5 1.5 2.5 3.5
@@ -28,7 +30,7 @@
 	*     1. ST_IDLE：四轮保持不动，只有连续检测到黑线满 5 秒才启动
 	*        （中途丢线超过 100ms 就重新计时；全黑/悬空不启动、不计时）
 	*     2. ST_RUN ：开始循线
-	*     3. 丢线超 1 秒 -> ST_STOP 永久停车；>=7 路命中超 300ms -> ST_STOP
+	*     3. 丢线超 1 秒 -> ST_STOP 永久停车；8 路全黑超 1 秒 -> ST_STOP
 	*     4. ST_STOP 中若重新连续见线满 5 秒，可再次启动（不用断电复位）
 	*
 	*   控制结构：
@@ -79,8 +81,10 @@ static void     Print_Debug(void);
 /* 数字电平判决门限：白纸约 136、黑线约 3909，取 12 位 ADC 中点 */
 #define GRAY_LOGIC_TH          2048.0f
 
-/* 至少 7 路同时命中，判为悬空/整片黑，不当成黑线 */
-#define GRAY_FULL_BLACK_CNT    7U
+/* 至少 8 路同时命中，判为悬空/整片黑（粗线拐角可能 7 路命中，不能算异常） */
+#define GRAY_FULL_BLACK_CNT    8U
+/* 黑段触到阵列边缘时，说明线已经伸出视野，直接给饱和偏差 */
+#define GRAY_EDGE_E            3.0f
 
 /* 传感器装反了（X1 实际在最右边）改成 1 */
 #define GRAY_REVERSE           0
@@ -119,7 +123,9 @@ static void     Print_Debug(void);
 /********************************************** 启动参数 *******************************************/
 #define START_HOLD_MS          5000U       /* 连续检测到黑线满 5 秒才启动（停车后重跑同样适用） */
 #define HOLD_GAP_TOL_MS        100U        /* 中途短暂丢线不超过 100ms 不清零 */
-#define FULL_BLACK_TIMEOUT_MS  300U        /* 全黑持续超时 */
+#define FULL_BLACK_TIMEOUT_MS  1000U       /* 8 路全黑持续超时（粗线拐角要留够时间） */
+#define FULL_BLACK_SPEED       60.0f       /* 全黑期间边转边走的基准速度 */
+#define FULL_BLACK_TURN        90.0f       /* 全黑期间叠加的差速，按最后方向硬转 */
 
 
 /********************************************** 地址线宏 *******************************************/
@@ -286,46 +292,51 @@ static void Control_20ms(void)
 	case ST_RUN:
 		if (s_valid == 2U)
 		{
-			/* 至少 7 路同时命中：悬空或整片黑，先停车，持续 300ms 永久停 */
-			Motors_Stop();
+			/* 8 路全黑：粗线拐角或整片黑。先按最后的方向硬转，持续超时才停车 */
 			s_dark_ms += CTRL_PERIOD_MS;
 			if (s_dark_ms >= FULL_BLACK_TIMEOUT_MS)
 			{
 				s_state = ST_STOP;
-				UART_Send("全黑异常超 300ms，停车。\r\n");
+				Motors_Stop();
+				UART_Send("整片全黑超时，停车。\r\n");
+				break;
 			}
-			break;
-		}
-		s_dark_ms = 0;
-
-		if (s_valid == 1U)
-		{
-			/* ===== 位置环（外环 PD）：输出左右目标速度，不直接碰 PWM ===== */
-
-			/* ① 偏差越大基础速度越低，过弯速度减慢但不丢线 */
-			s_v_base = V_BASE * (1.0f - (1.0f - V_MIN_RATIO) * fabsf(s_e) / 3.5f);
-
-			/* ② PD 算差速：E>0 线在右 -> 左轮快右轮慢 -> 向右转 */
-			s_dv = KP_POS * s_e + KD_POS * (s_e - s_e_last);
-			if (s_dv >  DV_LIMIT) s_dv =  DV_LIMIT;
-			if (s_dv < -DV_LIMIT) s_dv = -DV_LIMIT;
-
-			vL = s_v_base + s_dv;
-			vR = s_v_base - s_dv;
+			vL = FULL_BLACK_SPEED + s_last_sign * FULL_BLACK_TURN;
+			vR = FULL_BLACK_SPEED - s_last_sign * FULL_BLACK_TURN;
 		}
 		else
 		{
-			/* ===== 丢线：按最后一次偏差符号，低速往那边转着找 ===== */
-			s_lost_ms += CTRL_PERIOD_MS;
-			if (s_lost_ms >= LOST_TIMEOUT_MS)
+			s_dark_ms = 0;
+
+			if (s_valid == 1U)
 			{
-				s_state = ST_STOP;
-				Motors_Stop();
-				UART_Send("丢线超过 1 秒，停车。\r\n");
-				break;
+				/* ===== 位置环（外环 PD）：输出左右目标速度，不直接碰 PWM ===== */
+
+				/* ① 偏差越大基础速度越低，过弯速度减慢但不丢线 */
+				s_v_base = V_BASE * (1.0f - (1.0f - V_MIN_RATIO) * fabsf(s_e) / 3.5f);
+
+				/* ② PD 算差速：E>0 线在右 -> 左轮快右轮慢 -> 向右转 */
+				s_dv = KP_POS * s_e + KD_POS * (s_e - s_e_last);
+				if (s_dv >  DV_LIMIT) s_dv =  DV_LIMIT;
+				if (s_dv < -DV_LIMIT) s_dv = -DV_LIMIT;
+
+				vL = s_v_base + s_dv;
+				vR = s_v_base - s_dv;
 			}
-			vL = LOST_SPEED + s_last_sign * LOST_TURN;
-			vR = LOST_SPEED - s_last_sign * LOST_TURN;
+			else
+			{
+				/* ===== 丢线：按最后一次偏差符号，低速往那边转着找 ===== */
+				s_lost_ms += CTRL_PERIOD_MS;
+				if (s_lost_ms >= LOST_TIMEOUT_MS)
+				{
+					s_state = ST_STOP;
+					Motors_Stop();
+					UART_Send("丢线超过 1 秒，停车。\r\n");
+					break;
+				}
+				vL = LOST_SPEED + s_last_sign * LOST_TURN;
+				vR = LOST_SPEED - s_last_sign * LOST_TURN;
+			}
 		}
 
 		/* 目标速度限幅：不允许反转，防止过度甩尾 */
@@ -672,9 +683,11 @@ static void Gray_Calibrate(void)
 
 /***************************************************************************************************
 *	函 数 名: Gray_CalcDark
-*	函数功能: 按数字电平判命中，再用“位置 * 连续性权重”求中心
+*	函数功能: 数字电平判黑 -> 找最长连续黑段 -> 求中心
 *	形    参: center 中心（探头序号单位），weight 权重和，hit 命中位图
-*	          valid：0=丢线，1=正常，2=至少 7 路命中（悬空/整片黑）
+*	          valid：0=丢线，1=正常，2=8 路全黑（悬空/整片黑）
+*	说    明: 黑段触到阵列左右边缘时，说明线已伸出视野，直接给 ±GRAY_EDGE_E 饱和转向，
+*	          避免“粗线拐角多路全黑 -> 重心居中 -> 转不过来”
 ****************************************************************************************************/
 static void Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *valid)
 {
@@ -683,47 +696,92 @@ static void Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *v
 	                                       0.5f,  1.5f,  2.5f,  3.5f};
 	static const float pw [GRAY_CH_NUM] = { 7.0f,  5.0f,  3.0f,  1.0f,
 	                                        1.0f,  3.0f,  5.0f,  7.0f};
+	uint8_t dark[GRAY_CH_NUM] = {0U};
+	uint8_t a        = 0U;      /* 最长连续段起点 */
+	uint8_t b        = 0U;      /* 最长连续段终点 */
+	uint8_t run_len  = 0U;
+	uint8_t best_len = 0U;
+	uint8_t cnt      = 0U;
 	float   sw = 0.0f;
 	float   se = 0.0f;
-	uint8_t cnt = 0;
 	int     i;
 
-	*hit = 0;
+	*hit    = 0;
+	*weight = 0.0f;
 
+	/* ① 按数字电平判黑，记到逻辑序号（GRAY_REVERSE 时左右翻转） */
 	for (i = 0; i < (int)GRAY_CH_NUM; i++)
 	{
-		/* 黑线对应的电平档位由标定自动确定极性 */
 		uint8_t is_black = s_black_high ? (s_raw[i] >= GRAY_LOGIC_TH)
 		                                : (s_raw[i] <  GRAY_LOGIC_TH);
 
 		if (is_black)
 		{
-			uint8_t idx = GRAY_REVERSE ? (uint8_t)(GRAY_CH_NUM - 1U - i) : (uint8_t)i;
+			uint8_t idx = GRAY_REVERSE ? (uint8_t)(GRAY_CH_NUM - 1U - (uint8_t)i) : (uint8_t)i;
 
-			*hit |= (uint8_t)(1U << idx);
-			se   += pos[idx] * pw[idx];
-			sw   += pw[idx];
+			dark[idx] = 1U;
+			*hit     |= (uint8_t)(1U << idx);
 			cnt++;
 		}
 	}
-
-	*weight = sw;
 
 	if (cnt == 0U)
 	{
 		*center = 0.0f;
 		*valid  = 0U;      /* 一路都没命中：丢线 */
+		return;
 	}
-	else if (cnt >= GRAY_FULL_BLACK_CNT)
+
+	if (cnt >= GRAY_FULL_BLACK_CNT)
 	{
 		*center = 0.0f;
-		*valid  = 2U;      /* 悬空/整片黑，不是可循的黑线 */
+		*valid  = 2U;      /* 8 路全黑：悬空/整片黑 */
+		return;
+	}
+
+	/* ② 找最长连续黑段 [a,b]，分散的地面误命中不参与计算 */
+	for (i = 0; i < (int)GRAY_CH_NUM; i++)
+	{
+		if (dark[i])
+		{
+			run_len++;
+			if (run_len > best_len)
+			{
+				best_len = run_len;
+				b        = (uint8_t)i;
+			}
+		}
+		else
+		{
+			run_len = 0U;
+		}
+	}
+	a = (uint8_t)(b - best_len + 1U);
+
+	/* ③ 黑段触到阵列边缘：线已伸出视野，饱和转向 */
+	if (a == 0U)
+	{
+		*center = -GRAY_EDGE_E;
+		*valid  = 1U;
+	}
+	else if (b == (uint8_t)(GRAY_CH_NUM - 1U))
+	{
+		*center = GRAY_EDGE_E;
+		*valid  = 1U;
 	}
 	else
 	{
+		/* ④ 黑段完全在阵列内部：加权重心，外圈命中时 E 被放大 */
+		for (i = (int)a; i <= (int)b; i++)
+		{
+			se += pos[i] * pw[i];
+			sw += pw[i];
+		}
 		*center = se / sw;
 		*valid  = 1U;
 	}
+
+	*weight = sw;
 }
 
 /***************************************************************************************************
