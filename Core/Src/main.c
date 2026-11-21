@@ -14,12 +14,12 @@
 	*     蓝灯亮 = 该路 OUT 高电平 = 该路判为黑线
 	*
 	*   判黑流程：
-	*     1. 上电标定 1.5 秒（传感器放在白纸上），记录每路白纸电平
-	*     2. 由白纸电平自动判断极性：白=低电平 -> 黑线=高电平（本模块）
+	*     1. 极性固定：GRAY_BLACK_IS_HIGH = 1（白≈136 / 黑≈3909），不依赖上电环境
+	*     2. 上电只采样 1.5 秒打印各通道电平作参考，不参与判断
 	*     3. 每 10ms 分时扫描 8 路，原始值 >= 2048 即判为该路压到黑线
 	*     4. 命中路数 1~7 路 -> 有效；0 路 -> 丢线；8 路全黑 -> 悬空/整片黑
 	*     5. 只取最长连续黑段参与计算；黑段触到 X1 或 X8 时，说明线已伸出视野，
-	*        直接输出 ±3.0 的饱和偏差，保证粗线拐角能硬转过去
+	*        直接输出 ±3.5 的饱和偏差，保证粗线拐角能硬转过去
 	*
 	*   位置与权重：
 	*     探头位置 pos 从左到右：-3.5 -2.5 -1.5 -0.5 0.5 1.5 2.5 3.5
@@ -81,10 +81,14 @@ static void     Print_Debug(void);
 /* 数字电平判决门限：白纸约 136、黑线约 3909，取 12 位 ADC 中点 */
 #define GRAY_LOGIC_TH          2048.0f
 
+/* 固定极性：本模块实测白纸≈136（低电平）、黑线≈3909（高电平）。
+ * 固定为 1 后不再依赖上电标定场景；若换成反相输出的板子，改成 0 */
+#define GRAY_BLACK_IS_HIGH     1U
+
 /* 至少 8 路同时命中，判为悬空/整片黑（粗线拐角可能 7 路命中，不能算异常） */
 #define GRAY_FULL_BLACK_CNT    8U
 /* 黑段触到阵列边缘时，说明线已经伸出视野，直接给饱和偏差 */
-#define GRAY_EDGE_E            3.0f
+#define GRAY_EDGE_E            3.5f
 
 /* 传感器装反了（X1 实际在最右边）改成 1 */
 #define GRAY_REVERSE           0
@@ -97,8 +101,8 @@ static void     Print_Debug(void);
 
 /********************************************** 位置环参数（外环 PD） *****************************/
 #define V_BASE                 150.0f      /* 基础前进速度 mm/s（弯道跟不住就先降这里） */
-#define V_MIN_RATIO            0.5f        /* 偏差最大时速度降到基础的 50% */
-#define KP_POS                 60.0f       /* 比例：每 1 个探头偏差 -> 60mm/s 差速 */
+#define V_MIN_RATIO            0.4f        /* 偏差最大时速度降到基础的 50% */
+#define KP_POS                 70.0f       /* 比例：每 1 个探头偏差 -> 60mm/s 差速 */
 #define KD_POS                 6.0f        /* 微分：抑制来回摇摆，从 KP 的 0.1 倍起步 */
 #define DV_LIMIT               200.0f      /* 差速限幅 mm/s */
 #define V_TARGET_MAX           350.0f      /* 单轮目标速度上限 mm/s */
@@ -151,8 +155,7 @@ static ADC_HandleTypeDef  s_hadc1;
 static UART_HandleTypeDef s_huart1;
 
 static uint16_t s_raw[GRAY_CH_NUM];      /* 本次扫描原始值 */
-static float    s_white[GRAY_CH_NUM];    /* 标定时每路的白纸电平，只用于判断极性 */
-static uint8_t  s_black_high = 1U;       /* 1=黑线输出高电平（本模块），0=输出低电平 */
+static float    s_white[GRAY_CH_NUM];    /* 标定时每路的电平，仅用于打印参考，不参与判黑 */
 
 static RunState s_state = ST_IDLE;
 
@@ -207,12 +210,17 @@ int main(void)
 	MotorD_Init();
 
 	UART_Send("\r\n=== 模式一：8 路灰度循线（数字量版） ===\r\n");
-	UART_Send("正在标定白纸电平，请把传感器放在白纸/浅色桌面上，保持 1.5 秒...\r\n");
+	UART_Send("正在采样各通道电平（放哪里都行，仅用于打印参考），保持 1.5 秒...\r\n");
 
 	Gray_Calibrate();
 
-	snprintf(msg, sizeof(msg), "标定完成。判据：原始值 %s 2048 判为黑线\r\n",
-	         s_black_high ? ">=" : "<");
+	snprintf(msg, sizeof(msg), "采样完成。固定极性：原始值 %s 2048 判为黑线（白≈136 / 黑≈3909）\r\n",
+	         (GRAY_BLACK_IS_HIGH != 0U) ? ">=" : "<");
+	UART_Send(msg);
+
+	snprintf(msg, sizeof(msg), "电平参考: %4d %4d %4d %4d %4d %4d %4d %4d\r\n",
+	         (int)s_white[0], (int)s_white[1], (int)s_white[2], (int)s_white[3],
+	         (int)s_white[4], (int)s_white[5], (int)s_white[6], (int)s_white[7]);
 	UART_Send(msg);
 
 	UART_Send("四轮保持不动：把黑线放到传感器下方并保持 5 秒，才会启动（全黑不启动）。\r\n");
@@ -507,11 +515,12 @@ static void Print_Debug(void)
 	if (diag_cnt >= 5U)
 	{
 		diag_cnt = 0;
-		snprintf(buf, sizeof(buf), "R:%u/%u/%u/%u/%u/%u/%u/%u\r\n",
+		snprintf(buf, sizeof(buf), "R:%u/%u/%u/%u/%u/%u/%u/%u E100:%d RAW100:%d\r\n",
 		         (unsigned)s_raw[0], (unsigned)s_raw[1],
 		         (unsigned)s_raw[2], (unsigned)s_raw[3],
 		         (unsigned)s_raw[4], (unsigned)s_raw[5],
-		         (unsigned)s_raw[6], (unsigned)s_raw[7]);
+		         (unsigned)s_raw[6], (unsigned)s_raw[7],
+		         (int)(s_e * 100.0f), (int)(s_e_raw * 100.0f));
 		UART_Send(buf);
 	}
 }
@@ -641,14 +650,13 @@ static void Gray_Scan(void)
 
 /***************************************************************************************************
 *	函 数 名: Gray_Calibrate
-*	函数功能: 上电放在白纸上采 1.5 秒，记录每路白纸电平，并自动判断极性
+*	函数功能: 上电采 1.5 秒各通道电平，仅用于打印参考；判黑极性固定，不再自动推断
 ****************************************************************************************************/
 static void Gray_Calibrate(void)
 {
 	uint32_t sum[GRAY_CH_NUM] = {0};
 	uint32_t cnt = 0;
 	uint32_t t0  = HAL_GetTick();
-	uint8_t  low_cnt = 0;
 	int      i;
 
 	while ((HAL_GetTick() - t0) < GRAY_CALIB_MS)
@@ -669,16 +677,6 @@ static void Gray_Calibrate(void)
 	{
 		s_white[i] = (float)sum[i] / (float)cnt;
 	}
-
-	/* 多数通道白电平低于 2048 -> 白=低电平，黑=高电平 */
-	for (i = 0; i < (int)GRAY_CH_NUM; i++)
-	{
-		if (s_white[i] < GRAY_LOGIC_TH)
-		{
-			low_cnt++;
-		}
-	}
-	s_black_high = (low_cnt >= 4U) ? 1U : 0U;
 }
 
 /***************************************************************************************************
@@ -712,8 +710,8 @@ static void Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *v
 	/* ① 按数字电平判黑，记到逻辑序号（GRAY_REVERSE 时左右翻转） */
 	for (i = 0; i < (int)GRAY_CH_NUM; i++)
 	{
-		uint8_t is_black = s_black_high ? (s_raw[i] >= GRAY_LOGIC_TH)
-		                                : (s_raw[i] <  GRAY_LOGIC_TH);
+		uint8_t is_black = (GRAY_BLACK_IS_HIGH != 0U) ? (s_raw[i] >= GRAY_LOGIC_TH)
+		                                             : (s_raw[i] <  GRAY_LOGIC_TH);
 
 		if (is_black)
 		{
@@ -790,19 +788,23 @@ static void Gray_CalcDark(float *center, float *weight, uint8_t *hit, uint8_t *v
 ****************************************************************************************************/
 static void FmtF(float v, int dec, char *out)
 {
-	int   neg = (v < 0.0f) ? 1 : 0;
-	float a   = neg ? -v : v;
+	int neg = (v < 0.0f) ? 1 : 0;
+	float a = neg ? -v : v;
 	int   mul = (dec == 2) ? 100 : 10;
 	int   x   = (int)(a * (float)mul + 0.5f);
+	int   ip  = x / mul;
+	int   fp  = x % mul;
+	int   n   = 0;
 
-	if (neg)
-	{
-		sprintf(out, "-%d.%0*d", x / mul, dec, x % mul);
-	}
-	else
-	{
-		sprintf(out, "+%d.%0*d", x / mul, dec, x % mul);
-	}
+	out[n++] = neg ? '-' : '+';
+
+	if (ip >= 100) out[n++] = (char)('0' + (ip / 100) % 10);
+	if (ip >= 10)  out[n++] = (char)('0' + (ip / 10) % 10);
+	out[n++] = (char)('0' + ip % 10);
+	out[n++] = '.';
+	if (dec == 2) out[n++] = (char)('0' + fp / 10);
+	out[n++] = (char)('0' + fp % 10);
+	out[n]   = '\0';
 }
 
 /***************************************************************************************************
