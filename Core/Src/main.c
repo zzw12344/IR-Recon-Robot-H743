@@ -29,6 +29,7 @@
 	*        （中途丢线超过 100ms 就重新计时；全黑/悬空不启动、不计时）
 	*     2. ST_RUN ：开始循线
 	*     3. 丢线超 1 秒 -> ST_STOP 永久停车；>=7 路命中超 300ms -> ST_STOP
+	*     4. ST_STOP 中若重新连续见线满 5 秒，可再次启动（不用断电复位）
 	*
 	*   控制结构：
 	*     每 10ms：扫 8 路 -> 算重心 E -> 一阶低通滤波
@@ -63,6 +64,7 @@ static void     FmtF(float v, int dec, char *out);
 static void     Motors_Stop(void);
 static float    SpeedPI(uint8_t idx, float target, float actual);
 static void     SpeedLoop(void);
+static uint8_t  StartHold_Update(void);
 static void     Control_20ms(void);
 static void     Print_Debug(void);
 
@@ -90,8 +92,8 @@ static void     Print_Debug(void);
 
 
 /********************************************** 位置环参数（外环 PD） *****************************/
-#define V_BASE                 200.0f      /* 基础前进速度 mm/s */
-#define V_MIN_RATIO            0.6f        /* 偏差最大时速度降到基础的 60% */
+#define V_BASE                 150.0f      /* 基础前进速度 mm/s（弯道跟不住就先降这里） */
+#define V_MIN_RATIO            0.5f        /* 偏差最大时速度降到基础的 50% */
 #define KP_POS                 60.0f       /* 比例：每 1 个探头偏差 -> 60mm/s 差速 */
 #define KD_POS                 6.0f        /* 微分：抑制来回摇摆，从 KP 的 0.1 倍起步 */
 #define DV_LIMIT               200.0f      /* 差速限幅 mm/s */
@@ -115,7 +117,7 @@ static void     Print_Debug(void);
 
 
 /********************************************** 启动参数 *******************************************/
-#define START_HOLD_MS          5000U       /* 连续检测到黑线满 5 秒才启动 */
+#define START_HOLD_MS          5000U       /* 连续检测到黑线满 5 秒才启动（停车后重跑同样适用） */
 #define HOLD_GAP_TOL_MS        100U        /* 中途短暂丢线不超过 100ms 不清零 */
 #define FULL_BLACK_TIMEOUT_MS  300U        /* 全黑持续超时 */
 
@@ -271,38 +273,13 @@ static void Control_20ms(void)
 	{
 	case ST_IDLE:
 		Motors_Stop();
-
-		if (s_valid == 1U)
+		if (StartHold_Update())
 		{
-			/* 连续见到黑线：累计时间，满 5 秒才启动 */
-			s_gap_ms = 0;
-			s_hold_ms += CTRL_PERIOD_MS;
-
-			if (s_hold_ms >= START_HOLD_MS)
-			{
-				s_hold_ms = 0;
-				s_e_last  = s_e;     /* 防止启动瞬间微分项爆出一个大值 */
-				s_lost_ms = 0;
-				s_dark_ms = 0;
-				s_state   = ST_RUN;
-				UART_Send("已连续检测到黑线 5 秒，启动！\r\n");
-			}
-		}
-		else if ((s_valid == 0U) && (s_hold_ms > 0U))
-		{
-			/* 累计过程中短暂丢线：不超过 100ms 只暂停，超过就清零重计 */
-			s_gap_ms += CTRL_PERIOD_MS;
-			if (s_gap_ms > HOLD_GAP_TOL_MS)
-			{
-				s_hold_ms = 0;
-				s_gap_ms  = 0;
-			}
-		}
-		else
-		{
-			/* 全黑/悬空，或者还没开始见线：一律清零，不启动 */
-			s_hold_ms = 0;
-			s_gap_ms  = 0;
+			s_e_last  = s_e;     /* 防止启动瞬间微分项爆出一个大值 */
+			s_lost_ms = 0;
+			s_dark_ms = 0;
+			s_state   = ST_RUN;
+			UART_Send("已连续检测到黑线 5 秒，启动！\r\n");
 		}
 		break;
 
@@ -367,10 +344,61 @@ static void Control_20ms(void)
 		break;
 
 	case ST_STOP:
+		Motors_Stop();
+		/* 停车后把线重新放回传感器下方并保持 5 秒，可以再次启动，不用断电 */
+		if (StartHold_Update())
+		{
+			s_e_last  = s_e;
+			s_lost_ms = 0;
+			s_dark_ms = 0;
+			s_state   = ST_RUN;
+			UART_Send("重新连续检测到黑线 5 秒，再次启动！\r\n");
+		}
+		break;
+
 	default:
 		Motors_Stop();
 		break;
 	}
+}
+
+/***************************************************************************************************
+*	函 数 名: StartHold_Update
+*	函数功能: 连续见线计时。返回 1 表示已连续检测到黑线满 START_HOLD_MS
+*	说    明: 全黑/悬空不计数；中途丢线超过 HOLD_GAP_TOL_MS 就清零重计
+****************************************************************************************************/
+static uint8_t StartHold_Update(void)
+{
+	if (s_valid == 1U)
+	{
+		s_gap_ms = 0;
+		s_hold_ms += CTRL_PERIOD_MS;
+
+		if (s_hold_ms >= START_HOLD_MS)
+		{
+			s_hold_ms = 0;
+			s_gap_ms  = 0;
+			return 1U;
+		}
+	}
+	else if ((s_valid == 0U) && (s_hold_ms > 0U))
+	{
+		/* 累计过程中短暂丢线：不超过 100ms 只暂停，超过就清零重计 */
+		s_gap_ms += CTRL_PERIOD_MS;
+		if (s_gap_ms > HOLD_GAP_TOL_MS)
+		{
+			s_hold_ms = 0;
+			s_gap_ms  = 0;
+		}
+	}
+	else
+	{
+		/* 全黑/悬空，或者还没开始见线：一律清零 */
+		s_hold_ms = 0;
+		s_gap_ms  = 0;
+	}
+
+	return 0U;
 }
 
 /***************************************************************************************************
@@ -447,7 +475,7 @@ static void Print_Debug(void)
 	char fdv[12];
 	uint32_t wait_left = 0;
 
-	if (s_state == ST_IDLE)
+	if ((s_state == ST_IDLE) || (s_state == ST_STOP))
 	{
 		wait_left = (s_hold_ms >= START_HOLD_MS) ? 0U
 		                                         : (START_HOLD_MS - s_hold_ms + 999U) / 1000U;
